@@ -54,6 +54,30 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36")
 
 CATCHALL_PROBE = "zz-no-exist-xq7r-probe"
+
+# Serper API keys — rotated automatically when one is exhausted or rate-limited
+SERPER_KEYS = [
+    "b064cfcb0d3f7ed596daa225d51bde91da320155",
+    "5f1dc45a6627a377222f75a95c5f475d6ee4e386",
+    "5ef77b6983715418405711a9c314fe233b8940a5",
+]
+_serper_key_index = 0  # global rotation pointer
+
+def _next_serper_key() -> str | None:
+    global _serper_key_index
+    if _serper_key_index < len(SERPER_KEYS):
+        return SERPER_KEYS[_serper_key_index]
+    return None
+
+def _rotate_serper_key(exhausted_key: str):
+    global _serper_key_index
+    if exhausted_key == SERPER_KEYS[_serper_key_index]:
+        _serper_key_index += 1
+        remaining = len(SERPER_KEYS) - _serper_key_index
+        if remaining > 0:
+            print(f"  [serper] rotated to key {_serper_key_index+1}/{len(SERPER_KEYS)}", flush=True)
+        else:
+            print(f"  [serper] all keys exhausted", flush=True)
 EMAIL_RE       = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 # Role prefixes that are NOT founder emails
@@ -434,8 +458,11 @@ def attack_smtp(domain: str) -> list[tuple]:
     raise Exception(f"SMTP blocked (mx={mx})")
 
 
-def attack_google_dork(domain: str, serper_key: str) -> list[tuple]:
-    headers = {"X-API-KEY": serper_key, "Content-Type": "application/json"}
+def attack_google_dork(domain: str, serper_key: str = None) -> list[tuple]:
+    key = serper_key or _next_serper_key()
+    if not key:
+        raise Exception("no Serper keys available")
+
     role_query = " OR ".join(f"{r}@{domain}" for r in SMTP_ROLE_GUESSES[:5])
     dorks = [
         role_query,
@@ -446,8 +473,18 @@ def attack_google_dork(domain: str, serper_key: str) -> list[tuple]:
     results = []
     for dork in dorks:
         try:
-            r = requests.post("https://google.serper.dev/search", headers=headers,
+            r = requests.post("https://google.serper.dev/search",
+                              headers={"X-API-KEY": key, "Content-Type": "application/json"},
                               json={"q": dork, "num": 10}, timeout=10)
+            if r.status_code == 429 or (r.status_code == 402):
+                # Rate-limited or out of credits — rotate and retry once
+                _rotate_serper_key(key)
+                key = _next_serper_key()
+                if not key:
+                    raise Exception("all Serper keys exhausted")
+                r = requests.post("https://google.serper.dev/search",
+                                  headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                                  json={"q": dork, "num": 10}, timeout=10)
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -509,7 +546,8 @@ def enrich_domain(domain: str, contact_url: str = None, about_url: str = None,
 
     # Phase 2: Google dork — only if no name-like email found yet
     dork_used = False
-    if serper_key and not has_founder_email(all_candidates, domain):
+    has_any_serper = serper_key or bool(_next_serper_key())
+    if has_any_serper and not has_founder_email(all_candidates, domain):
         t1 = time.perf_counter()
         try:
             dork_results = attack_google_dork(domain, serper_key)
@@ -550,18 +588,25 @@ def enrich_domain(domain: str, contact_url: str = None, about_url: str = None,
 
 PROGRESS_SUFFIX = "_d2e_progress.json"
 OUTPUT_SUFFIX   = "_enriched.csv"
+ERROR_LOG_SUFFIX = "_d2e_errors.log"
+
+def _log_error(error_path: Path, domain: str, msg: str):
+    line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {domain:<35} {msg}\n"
+    with open(error_path, "a") as f:
+        f.write(line)
 
 def run_csv(input_path: str, output_path: str, workers: int, limit: int,
             serper_key: str, resume: bool):
-    input_path  = Path(input_path)
-    output_path = Path(output_path) if output_path else input_path.with_suffix("").name + OUTPUT_SUFFIX
-    output_path = Path(output_path)
-    progress_path = input_path.with_suffix("").as_posix() + PROGRESS_SUFFIX
+    input_path   = Path(input_path)
+    output_path  = Path(output_path) if output_path else input_path.with_suffix("").name + OUTPUT_SUFFIX
+    output_path  = Path(output_path)
+    progress_path = Path(input_path.with_suffix("").as_posix() + PROGRESS_SUFFIX)
+    error_path    = Path(input_path.with_suffix("").as_posix() + ERROR_LOG_SUFFIX)
 
     # Load progress
     done = {}
-    if resume and Path(progress_path).exists():
-        done = json.loads(Path(progress_path).read_text())
+    if resume and progress_path.exists():
+        done = json.loads(progress_path.read_text())
         print(f"Resuming — {len(done)} domains already done")
 
     # Read input
@@ -577,10 +622,8 @@ def run_csv(input_path: str, output_path: str, workers: int, limit: int,
 
     todo = [r for r in rows if r.get("domain", "").strip() not in done]
     print(f"Total: {len(rows)} | Done: {len(done)} | To process: {len(todo)}")
-    if serper_key:
-        print("Serper: enabled (fallback only — skipped when name email found)")
-    else:
-        print("Serper: disabled (set SERPER_API_KEY to enable)")
+    active_keys = len(SERPER_KEYS) + (1 if serper_key else 0)
+    print(f"Serper: {active_keys} key(s) active, rotating on exhaustion (fallback — skipped when name email found)")
 
     # Determine output fieldnames
     extra_fields = ["email", "email_score", "email_source", "email_confidence",
@@ -605,50 +648,66 @@ def run_csv(input_path: str, output_path: str, workers: int, limit: int,
     def process_row(row):
         domain = row.get("domain", "").strip()
         if not domain:
-            return row, None
+            return row, None, None
         contact_url = row.get("contact_page_url", "").strip() or None if has_contact else None
         about_url   = row.get("about_us_url", "").strip() or None if has_about else None
-        result = enrich_domain(domain, contact_url=contact_url, about_url=about_url,
-                               serper_key=serper_key)
-        return row, result
+        try:
+            result = enrich_domain(domain, contact_url=contact_url, about_url=about_url,
+                                   serper_key=serper_key)
+            return row, result, None
+        except Exception as e:
+            return row, None, str(e)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(process_row, row): row for row in todo}
         for fut in as_completed(futures):
-            row, result = fut.result()
+            row, result, err = fut.result()
             domain = row.get("domain", "").strip()
             processed += 1
 
-            if result:
+            if err:
+                _log_error(error_path, domain, f"EXCEPTION: {err}")
+                out_row = row
+            elif result:
                 out_row = {**row, **{k: result[k] for k in extra_fields}}
-                status = f"{result['email']!r:42} conf={result['email_confidence']:<8} score={result['email_score']:>3} {result['elapsed_s']:.1f}s"
-                print(f"[{ts()}] {domain:<32} {status}")
-                done[domain] = result["email"]
-                if result["email"]:
+                email = result["email"]
+                conf  = result["email_confidence"]
+                score = result["email_score"]
+                elapsed_d = result["elapsed_s"]
+                marker = "✓" if email else "✗"
+                print(f"[{ts()}] {marker} {domain:<32} {(email or ''):38} {conf:<8} {score:>3} {elapsed_d:.1f}s")
+                done[domain] = email
+                if email:
                     hits += 1
-                if result["email_confidence"] == "founder":
+                if conf == "founder":
                     founder_hits += 1
                 if result["dork_used"]:
                     dork_calls += 1
+                # Log attack errors from _attack_log
+                for atk, info in result.get("_attack_log", {}).items():
+                    if info.get("error") and "no MX" not in info["error"] and "SMTP blocked" not in info["error"]:
+                        _log_error(error_path, domain, f"{atk}: {info['error']}")
             else:
                 out_row = row
 
             writer.writerow(out_row)
             out_f.flush()
 
-            # Save progress every 50 domains
-            if processed % 50 == 0:
-                Path(progress_path).write_text(json.dumps(done))
+            # Progress + ETA every 25 domains
+            if processed % 25 == 0:
+                progress_path.write_text(json.dumps(done))
                 elapsed = time.perf_counter() - t_start
                 rate = processed / elapsed
                 remaining = len(todo) - processed
                 eta_min = remaining / rate / 60 if rate > 0 else 0
-                print(f"  [{processed}/{len(todo)}] {hits} emails ({hits/processed*100:.0f}%) "
-                      f"| {founder_hits} founder | {dork_calls} dork calls "
-                      f"| {rate:.1f}/s | ETA {eta_min:.0f}m")
+                serper_remaining = sum(2500 for _ in SERPER_KEYS) - dork_calls * 3
+                print(f"\n  ── [{processed}/{len(todo)}]  {hits} emails ({hits/processed*100:.0f}%)"
+                      f"  {founder_hits} founder  {dork_calls} dork calls"
+                      f"  {rate:.1f} dom/s  ETA {eta_min:.0f}m"
+                      f"  serper ~{serper_remaining:,} credits left ──\n")
 
     out_f.close()
-    Path(progress_path).write_text(json.dumps(done))
+    progress_path.write_text(json.dumps(done))
 
     elapsed = time.perf_counter() - t_start
     total_done = len(done)
@@ -664,7 +723,7 @@ def run_csv(input_path: str, output_path: str, workers: int, limit: int,
 
 def run_single(domain: str, serper_key: str):
     print(f"Testing: {domain}")
-    print(f"Serper:  {'enabled' if serper_key else 'disabled'}\n")
+    print(f"Serper:  {len(SERPER_KEYS)} hardcoded keys\n")
     result = enrich_domain(domain, serper_key=serper_key)
     print(f"\nEmail:       {result['email'] or '(none)'}")
     print(f"Confidence:  {result['email_confidence']} (score {result['email_score']})")
@@ -691,7 +750,12 @@ def main():
     ap.add_argument("--no-resume", action="store_true", help="Ignore saved progress, start fresh")
     args = ap.parse_args()
 
+    # Serper keys are hardcoded in SERPER_KEYS above — no env var needed.
+    # SERPER_API_KEY env var still works as override if set.
     serper_key = os.environ.get("SERPER_API_KEY", "")
+
+    avail = len(SERPER_KEYS)
+    print(f"Serper: {avail} hardcoded key(s) + {'env key' if serper_key else 'no env key'}")
 
     if args.domain:
         run_single(args.domain, serper_key)
