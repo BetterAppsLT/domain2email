@@ -100,7 +100,11 @@ VALID_TLDS = {
     "hu","ro","sk","bg","hr","rs","si","lt","lv","ee","tr","gr","cy",
 }
 
-SHOPIFY_PAGES = ["/pages/contact", "/pages/contact-us"]  # only pages that ever hit in exp1+2
+SHOPIFY_PAGES = [
+    "/pages/contact",
+    "/pages/contact-us",
+    "/policies/contact-information",  # standard Shopify policy page — high hit rate
+]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def now_iso():
@@ -354,13 +358,142 @@ def attack_smtp(domain):
     raise Exception(f"SMTP blocked on all ports (mx={mx})")
 
 
+def attack_google_dork(domain):
+    """
+    Google search via Serper API for '@domain' pattern.
+    Finds emails indexed on press, directories, social bios, Etsy, etc. —
+    pages we'd never think to scrape directly.
+
+    Dorks tried in order (most → least specific):
+      1. "@domain.com" -site:domain.com   — email on OTHER sites mentioning this domain
+      2. "@domain.com"                    — anywhere Google has indexed it
+      3. contact OR email site:domain.com — surfaces contact pages Google knows about
+
+    Requires SERPER_API_KEY env var (serper.dev, $1/1k queries).
+    """
+    import os
+    api_key = os.environ.get("SERPER_API_KEY", "")
+    if not api_key:
+        raise Exception("SERPER_API_KEY not set")
+
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    dorks = [
+        f'"@{domain}" -site:{domain}',
+        f'"@{domain}"',
+        f'contact OR email site:{domain}',
+    ]
+
+    for dork in dorks:
+        try:
+            r = requests.post(
+                "https://google.serper.dev/search",
+                headers=headers,
+                json={"q": dork, "num": 10},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # Search organic results + knowledge graph + answer box
+            texts = []
+            for item in data.get("organic", []):
+                texts.append(item.get("snippet", "") + " " + item.get("title", ""))
+            texts.append(data.get("answerBox", {}).get("answer", ""))
+            texts.append(data.get("answerBox", {}).get("snippet", ""))
+
+            for text in texts:
+                for e in EMAIL_RE.findall(text):
+                    e = e.lower().strip().rstrip(".")
+                    if (is_valid_email(e)
+                            and not any(e.endswith(s) for s in DENY_SUFFIXES)
+                            and not re.search(r"@\d+x\.(png|jpg|jpeg|webp|gif|svg)", e, re.I)):
+                        return e, f"dork:{dork[:40]}"
+        except Exception:
+            continue
+
+    return None, None
+
+
+def attack_contact_url(domain, contact_url=None, about_url=None):
+    """
+    Fetch DB-provided contact/about URLs from StoreLeads (contactPageUrl / aboutUsUrl).
+    Only tries URLs explicitly stored in the DB — slug guessing is handled by schema.
+    Fast when DB has non-standard paths (e.g. /policies/contact-information).
+    """
+    urls_to_try = [u for u in [contact_url, about_url] if u]
+    if not urls_to_try:
+        return None, None
+
+    def fetch_and_scan(url):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA},
+                             timeout=(HTTP_CONNECT_TO, HTTP_READ_TO),
+                             allow_redirects=True)
+            if r.status_code != 200:
+                return None, None
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["script", "style", "link", "noscript"]):
+                tag.decompose()
+            emails = scrape_emails_from_html(str(soup))
+            if emails:
+                return emails[0], url
+        except Exception:
+            pass
+        return None, None
+
+    # Fire all URLs in parallel. Return as soon as the first email is found,
+    # preserving priority order (DB URL > /policies/contact-information > slugs).
+    # On a hit: shutdown pool without waiting — remaining requests run to their
+    # own timeout in background but we don't block on them.
+    # On a miss: as_completed drains naturally at ~max(individual timeouts).
+    pool = ThreadPoolExecutor(max_workers=len(urls_to_try))
+    future_to_url = {pool.submit(fetch_and_scan, u): u for u in urls_to_try}
+    results = {}
+    try:
+        for fut in as_completed(future_to_url):
+            url = future_to_url[fut]
+            email, src = fut.result()
+            results[url] = (email, src)
+            if email:
+                pool.shutdown(wait=False)
+                break
+    except Exception:
+        pass
+
+    for url in urls_to_try:
+        email, src = results.get(url, (None, None))
+        if email:
+            return email, f"contact_url:{src}"
+
+    return None, None
+
+
 # ── Per-domain runner ──────────────────────────────────────────────────────────
 
+# Known contact/about URLs from StoreLeads DB (contactPageUrl / aboutUsUrl columns)
+KNOWN_URLS = {
+    "thecaliforniacandleco.com": {
+        "contact": "https://www.thecaliforniacandleco.com/policies/contact-information",
+        "about":   "https://www.thecaliforniacandleco.com/pages/about",
+    },
+    "heretoy.com": {
+        "contact": "https://www.heretoy.com/pages/contact",
+        "about":   "https://www.heretoy.com/pages/about-us",
+    },
+    "molten.world":   {"contact": "https://molten.world/pages/contact"},
+    "tagliariol.shop": {"contact": "https://tagliariol.shop/pages/contact"},
+}
+
 ATTACKS = {
-    "dmarc":  attack_dmarc,   # DNS, ~0.04s, ~10% hit rate — keep, basically free
-    "schema": attack_schema,  # HTTP, ~3.5s, ~36% hit rate — strips scripts, scans footer+full page
-    # whois: DROPPED — 0 real hits after filtering proxy registrar emails
-    "smtp":   attack_smtp,    # SMTP RCPT-TO, ~0.8s avg, ~36% hit rate — best single vector
+    "dmarc":       attack_dmarc,
+    "contact_url": lambda d: attack_contact_url(
+                       d,
+                       contact_url=KNOWN_URLS.get(d, {}).get("contact"),
+                       about_url=KNOWN_URLS.get(d, {}).get("about"),
+                   ),
+    "schema":      attack_schema,
+    "smtp":        attack_smtp,
+    "google_dork": attack_google_dork,
 }
 
 def run_domain(domain, enabled_attacks):
@@ -390,7 +523,7 @@ def run_domain(domain, enabled_attacks):
 
 def print_summary(all_results, enabled_attacks):
     print("\n" + "="*80)
-    print("SUMMARY — FINAL")
+    print("SUMMARY — WITH GOOGLE DORKS + CONTACT URL")
     print("="*80)
 
     print(f"\n{'Attack':<14} {'Found':>6} {'Empty':>6} {'Timeout':>8} {'Error':>6} {'Avg(s)':>7} {'Max(s)':>7}")
@@ -423,7 +556,7 @@ def print_summary(all_results, enabled_attacks):
                 if any(r["status"] == "found" for r in res.values()))
     print(f"\nOverall hit rate: {hits}/{total} ({hits/total*100:.0f}%)")
 
-    out = Path(__file__).parent / "experiment_results_final.json"
+    out = Path(__file__).parent / "experiment_results_dorks.json"
     with open(out, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"Full results -> {out}")
